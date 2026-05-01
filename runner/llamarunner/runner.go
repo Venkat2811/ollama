@@ -521,6 +521,11 @@ func (s *Server) processBatch(tokenBatch *llama.Batch, embedBatch *llama.Batch) 
 			seq.generationDuration += time.Since(t)
 		} else {
 			seq.processingDuration += time.Since(t)
+			// Tensorpuffer post-prefill stash (Direction B). Fires
+			// exactly once per request — on the iteration where
+			// prefill just finished and the first sample landed.
+			// No-op when TPUF_KVBM_ENABLE is unset.
+			s.cache.StashToPuffer(seq.cache)
 		}
 
 		// if done processing the prompt, generate an embedding and return

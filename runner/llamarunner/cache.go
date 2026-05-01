@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/ollama/ollama/integrations/tensorpuffer"
 	"github.com/ollama/ollama/llama"
 )
 
@@ -21,6 +22,11 @@ type InputCache struct {
 	multiUserCache bool
 
 	lc *llama.Context
+
+	// Tensorpuffer integration (Direction B). Both fields are nil and
+	// "" when TPUF_KVBM_ENABLE is unset. See cache_tensorpuffer.go.
+	tpufHandle  *tensorpuffer.Handle
+	tpufModelID string
 }
 
 func NewInputCache(lc *llama.Context, kvSize int, numSlots int, multiUserCache bool) (*InputCache, error) {
@@ -37,12 +43,14 @@ func NewInputCache(lc *llama.Context, kvSize int, numSlots int, multiUserCache b
 		}
 	}
 
-	return &InputCache{
+	c := &InputCache{
 		numCtx:         kvSize / numSlots,
 		slots:          slots,
 		multiUserCache: multiUserCache,
 		lc:             lc,
-	}, nil
+	}
+	c.initTpuf() // no-op unless TPUF_KVBM_ENABLE=1
+	return c, nil
 }
 
 // Locking: Operations on InputCacheSlot (including finding one
@@ -67,6 +75,15 @@ func (c *InputCache) LoadCacheSlot(prompt []input, cachePrompt bool) (*InputCach
 	var slot *InputCacheSlot
 	var numPast int
 	var err error
+
+	// Tensorpuffer fast-path (Direction B): before the in-memory linear
+	// scan, probe the puffer for an exact-match prompt. On hit, restore
+	// the slot's KV state via llama_state_seq_set_data and return as if
+	// LoadCacheSlot's normal "perfect prefix" path produced it. Misses
+	// fall through to the existing prefix-match logic untouched.
+	if tpufSlot, tpufRem, ok := c.tryLoadFromPuffer(prompt, cachePrompt); ok {
+		return tpufSlot, tpufRem, nil
+	}
 
 	// In single-user scenarios, the longest cache slot works fine for getting good input
 	// cache hit rates and it reuses the same VRAM over and over again, which is good for
