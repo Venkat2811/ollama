@@ -101,8 +101,28 @@ func writeTensor(buf []byte, t ml.Tensor) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	bytes := t.Bytes()
+	// Use BackendBytes (sync-independent) instead of Bytes(): the
+	// Causal cache's keys/values tensors are written by SetRows as
+	// graph side-effects and never get their sync field set by
+	// Compute, so plain Bytes() returns nil for them. BackendBytes
+	// reads the backend buffer directly, which is correct here
+	// because by the time StashToPuffer fires (numPredicted == 1)
+	// the runner has already waited on prefill compute to complete.
+	bytes := t.BackendBytes()
 	shape := t.Shape()
+	// Sanity: catch the empty-bytes case anyway in case some future
+	// backend's BackendBytes returns nil too.
+	expectedNbytes := 1
+	for _, d := range shape {
+		expectedNbytes *= d
+	}
+	expectedNbytes *= dtypeBytesPerElem(t.DType())
+	if len(bytes) == 0 || (expectedNbytes > 0 && len(bytes) != expectedNbytes) {
+		return nil, fmt.Errorf(
+			"%w: Tensor.BackendBytes returned %d bytes for shape %v dtype %v (expected %d)",
+			ErrSerializeUnsupported, len(bytes), shape, t.DType(), expectedNbytes,
+		)
+	}
 	header := make([]byte, 2+4*len(shape)+8)
 	header[0] = dc
 	header[1] = uint8(len(shape))
@@ -113,6 +133,21 @@ func writeTensor(buf []byte, t ml.Tensor) ([]byte, error) {
 	buf = append(buf, header...)
 	buf = append(buf, bytes...)
 	return buf, nil
+}
+
+// dtypeBytesPerElem returns the storage size of a single element for
+// a given dtype. Used as a sanity-check on Tensor.Bytes return size
+// (catches the silent "sync == nil" case).
+func dtypeBytesPerElem(d ml.DType) int {
+	switch d {
+	case ml.DTypeF32, ml.DTypeI32:
+		return 4
+	case ml.DTypeF16:
+		return 2
+	}
+	// Quantized formats are not byte-per-elem; return 0 to skip the
+	// equality check above.
+	return 0
 }
 
 // bytesToF32 reinterprets a byte slice (4 bytes per float, little-endian)

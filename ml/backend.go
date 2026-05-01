@@ -138,6 +138,13 @@ type Tensor interface {
 	Bytes() []byte
 	Floats() []float32
 	BackendGet() []float32
+	// BackendBytes is a sync-independent variant of Bytes — it always
+	// reads the tensor's backend buffer regardless of whether sync
+	// was wired by Compute. Mirrors BackendGet() for raw bytes; used
+	// by the tensorpuffer integration to capture cache tensors that
+	// were written by SetRows as graph side-effects (and thus never
+	// have their sync set on Compute, so plain Bytes() returns nil).
+	BackendBytes() []byte
 
 	FromBytes([]byte)
 	FromFloats([]float32)

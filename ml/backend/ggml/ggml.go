@@ -1092,6 +1092,21 @@ func (t *Tensor) BackendGet() []float32 {
 	return data
 }
 
+func (t *Tensor) BackendBytes() []byte {
+	n := C.ggml_nbytes(t.t)
+	if n == 0 {
+		return nil
+	}
+
+	if t.sync != nil {
+		t.sync()
+	}
+
+	data := make([]byte, n)
+	C.ggml_backend_tensor_get(t.t, unsafe.Pointer(&data[0]), 0, n)
+	return data
+}
+
 func tensorSet[S ~[]E, E byte | float32 | int32](t *Tensor, s S) {
 	if len(s) == 0 {
 		return
