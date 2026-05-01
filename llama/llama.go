@@ -207,6 +207,56 @@ func (c *Context) KvCacheCanShift() bool {
 	return bool(C.llama_memory_can_shift(C.llama_get_memory(c.c)))
 }
 
+// StateSeqGetSize returns the number of bytes the state of `seqId`
+// occupies. Equivalent to `llama_state_seq_get_size`. Used by the
+// tensorpuffer integration to size the buffer before extracting KV
+// bytes for stash.
+func (c *Context) StateSeqGetSize(seqId int) int {
+	return int(C.llama_state_seq_get_size(c.c, C.llama_seq_id(seqId)))
+}
+
+// StateSeqGetData copies the per-sequence state for `seqId` into a
+// freshly allocated byte slice. Returns the bytes actually written.
+// Direct wrapper around `llama_state_seq_get_data`.
+//
+// The returned bytes are opaque — they can be round-tripped through
+// StateSeqSetData on a context with a matching model + cache shape.
+func (c *Context) StateSeqGetData(seqId int) []byte {
+	size := c.StateSeqGetSize(seqId)
+	if size <= 0 {
+		return nil
+	}
+	buf := make([]byte, size)
+	written := C.llama_state_seq_get_data(
+		c.c,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+		C.size_t(size),
+		C.llama_seq_id(seqId),
+	)
+	if int(written) != size {
+		// Library writer returned less than the size it advertised; trim.
+		return buf[:int(written)]
+	}
+	return buf
+}
+
+// StateSeqSetData restores per-sequence state for `seqId` from the
+// bytes returned by a prior StateSeqGetData. Returns the number of
+// tokens recovered (matching llama_state_seq_set_data's contract).
+// Zero indicates failure to restore.
+func (c *Context) StateSeqSetData(seqId int, data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	n := C.llama_state_seq_set_data(
+		c.c,
+		(*C.uint8_t)(unsafe.Pointer(&data[0])),
+		C.size_t(len(data)),
+		C.llama_seq_id(seqId),
+	)
+	return int(n)
+}
+
 // Get the embeddings for a sequence id
 func (c *Context) GetEmbeddingsSeq(seqId int) []float32 {
 	e := unsafe.Pointer(C.llama_get_embeddings_seq(c.c, C.int(seqId)))
