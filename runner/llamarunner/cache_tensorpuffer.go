@@ -121,25 +121,37 @@ func (c *InputCache) tryLoadFromPuffer(prompt []input, cachePrompt bool) (*Input
 		return nil, nil, false
 	}
 
-	// Clear whatever's in this slot's KV before restoring; same
-	// guarantee LoadCacheSlot makes when it picks a slot.
-	if c.lc != nil {
-		c.lc.KvCacheSeqRm(target.Id, 0, -1)
-		n := c.lc.StateSeqSetData(target.Id, blob)
-		if n <= 0 {
-			slog.Warn("tensorpuffer restore returned 0 tokens — falling through",
-				"slot", target.Id, "blob_bytes", len(blob))
-			return nil, nil, false
-		}
-		slog.Info("tensorpuffer hit", "slot", target.Id, "tokens", n,
-			"prompt_len", len(prompt), "blob_bytes", len(blob))
-	}
-
 	// Match LoadCacheSlot's "leave one input to sample" convention.
+	// The stash holds state for the full prompt; we restore that, then
+	// trim the cache down to `keep` so the runner re-decodes the last
+	// token and lands on logits the sampler can consume. Skipping the
+	// trim leaves the last position double-occupied and the next
+	// Decode aborts inside ggml_metal.
 	keep := len(prompt) - 1
 	if keep < 0 {
 		keep = 0
 	}
+
+	if c.lc != nil {
+		c.lc.KvCacheSeqRm(target.Id, 0, -1)             // wipe slot
+		n := c.lc.StateSeqSetData(target.Id, blob)      // restore full state
+		if n <= 0 {
+			slog.Warn("tensorpuffer restore returned 0 — falling through",
+				"slot", target.Id, "blob_bytes", len(blob))
+			return nil, nil, false
+		}
+		// Drop everything from `keep` onwards so the runner can
+		// re-insert the last token and produce logits.
+		if !c.lc.KvCacheSeqRm(target.Id, keep, -1) {
+			slog.Warn("tensorpuffer trim post-restore failed — wiping and falling through",
+				"slot", target.Id)
+			c.lc.KvCacheSeqRm(target.Id, 0, -1)
+			return nil, nil, false
+		}
+		slog.Info("tensorpuffer hit", "slot", target.Id,
+			"prompt_len", len(prompt), "keep", keep, "blob_bytes", len(blob))
+	}
+
 	target.Inputs = make([]input, keep)
 	copy(target.Inputs, prompt[:keep])
 	target.InUse = true
