@@ -97,6 +97,33 @@ func IsTpufStashResponseEnabled() bool {
 	return v == "1" || v == "true" || v == "TRUE"
 }
 
+// IsTpufAsyncStashEnabled reports whether the post-prefill KV state PUT
+// (and the response sidecar PUT in removeSequence) should run on a
+// background goroutine instead of blocking the http response.
+//
+// Sync stash (default): http request blocks until both PUTs complete —
+// adds ~1.5 s for qwen3's 4.7 GiB blob, ~14 s for a 30 GiB sharegpt run.
+// Safe — the very next request can warm-load.
+//
+// Async stash: http request returns as soon as SerializeState finishes
+// (a fast in-memory copy). The PUT lands on a goroutine. A re-fire that
+// arrives before the PUT completes will miss the warm path and fall
+// through to cold. For typical workloads (>50 ms inter-request delay) the
+// PUT lands first; benchmarks with a tight cold→warm loop should keep
+// async off.
+//
+// Caveats:
+//   - In-flight goroutines are dropped on process exit (no graceful drain)
+//   - Concurrent stashes serialize at the C ABI handle's internal mutex,
+//     so async doesn't increase real throughput — it just decouples the
+//     http response from the PUT.
+//
+// Default off — opt in with TPUF_KVBM_ASYNC_STASH=1.
+func IsTpufAsyncStashEnabled() bool {
+	v := os.Getenv("TPUF_KVBM_ASYNC_STASH")
+	return v == "1" || v == "true" || v == "TRUE"
+}
+
 func (c *InputCache) initTpuf() {
 	if c.tpufHandle != nil {
 		return
@@ -332,6 +359,11 @@ func (c *InputCache) tryLoadFromPuffer(
 //   - TPUF_KVBM_STASH_RESPONSE is unset (gating env)
 //   - tpufHandle is nil (TPUF disabled or init failed)
 //   - response is empty (don't pollute the puffer with no-output rows)
+//
+// Honors TPUF_KVBM_ASYNC_STASH: when set, the PUT runs on a background
+// goroutine and the http response returns immediately. The response
+// blob is small (~4 B/token) so this is a smaller win than async-stashing
+// the KV state, but we keep the path consistent.
 func (c *InputCache) StashResponseToPuffer(promptTokens []uint32, response []int32) {
 	if c.tpufHandle == nil || !IsTpufStashResponseEnabled() {
 		return
@@ -345,6 +377,15 @@ func (c *InputCache) StashResponseToPuffer(promptTokens []uint32, response []int
 	for i, tok := range response {
 		binary.LittleEndian.PutUint32(blob[i*4:], uint32(tok))
 	}
+
+	if IsTpufAsyncStashEnabled() {
+		go c.stashResponse(promptTokens, response, blob)
+		return
+	}
+	c.stashResponse(promptTokens, response, blob)
+}
+
+func (c *InputCache) stashResponse(promptTokens []uint32, response []int32, blob []byte) {
 	sideID := responseModelID(c.tpufModelID)
 	n, err := c.tpufHandle.StashPrefix(sideID, promptTokens, blob)
 	if err != nil {
@@ -399,6 +440,13 @@ func (c *InputCache) tryLoadResponseFromPuffer(promptTokens []uint32) ([]int32, 
 // Pass firstToken < 0 to skip the sidecar stash (FULL_SKIP becomes
 // unavailable for this prompt; the warm load takes the trim+redecode
 // path). Sidecar failure is non-fatal — the KV state is still stashed.
+//
+// SerializeState is always synchronous — the cache state mutates on the
+// next batch, so we must capture the bytes before yielding the lock.
+// The actual S3/foyer PUT is sync by default but moves to a background
+// goroutine when TPUF_KVBM_ASYNC_STASH=1 (drops the PUT cost from the
+// http response time at the cost of a brief race window where a re-fire
+// can miss the warm path).
 func (c *InputCache) StashToPuffer(slot *InputCacheSlot, firstToken int32) {
 	if c.tpufHandle == nil || slot == nil || c.cache == nil {
 		return
@@ -420,14 +468,28 @@ func (c *InputCache) StashToPuffer(slot *InputCacheSlot, firstToken int32) {
 	if len(blob) == 0 {
 		return
 	}
+
+	if IsTpufAsyncStashEnabled() {
+		go c.stashKVAndFirstToken(tokens, blob, firstToken, slot.Id)
+		return
+	}
+	c.stashKVAndFirstToken(tokens, blob, firstToken, slot.Id)
+}
+
+// stashKVAndFirstToken does the actual PUT(s). Runs synchronously on the
+// caller's goroutine in the default path, or on a fresh goroutine when
+// TPUF_KVBM_ASYNC_STASH=1. Either way, the C ABI's internal mutex
+// serializes concurrent stashes — async only decouples the http response
+// from the PUT, it doesn't parallelize.
+func (c *InputCache) stashKVAndFirstToken(tokens []uint32, blob []byte, firstToken int32, slotID int) {
 	n, err := c.tpufHandle.StashPrefix(c.tpufModelID, tokens, blob)
 	if err != nil {
 		slog.Warn("tensorpuffer stash failed (continuing)", "err", err,
-			"slot", slot.Id, "tokens", len(tokens))
+			"slot", slotID, "tokens", len(tokens))
 		return
 	}
 	slog.Info("tensorpuffer stashed (ollamarunner)",
-		"slot", slot.Id, "tokens", len(tokens), "bytes", n)
+		"slot", slotID, "tokens", len(tokens), "bytes", n)
 
 	// Optional sidecar: stash the first sampled token under a sibling
 	// model_id. Only fires when FULL_SKIP is enabled, to keep S3
@@ -441,10 +503,10 @@ func (c *InputCache) StashToPuffer(slot *InputCacheSlot, firstToken int32) {
 		sn, err := c.tpufHandle.StashPrefix(sideID, tokens, ftBytes[:])
 		if err != nil {
 			slog.Warn("tensorpuffer first-token sidecar stash failed (continuing)",
-				"err", err, "slot", slot.Id)
+				"err", err, "slot", slotID)
 			return
 		}
 		slog.Info("tensorpuffer first-token sidecar stashed",
-			"slot", slot.Id, "first_token", firstToken, "bytes", sn)
+			"slot", slotID, "first_token", firstToken, "bytes", sn)
 	}
 }
