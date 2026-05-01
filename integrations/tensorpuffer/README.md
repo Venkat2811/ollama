@@ -180,8 +180,20 @@ benefit is gone (as expected).
       tensorpuffer-bench process and vice versa.
 - [ ] Direction A as a true composition wrapper — blocked on Ollama
       API exposure of `slots` / `InputCacheSlot`.
-- [ ] `ollamarunner` (the pure-Go ML path) — separate codec needed since
-      KV state lives in `kvcache.Cache` not in a `*llama.Context`.
+- [⚠] `ollamarunner` (the pure-Go ML path) — integration wired, hooks
+      fire, prefill compute drops 10× on warm, **but model output is
+      wrong** on the warm path. See the WIP commit `f0fa8d61` and
+      `kvcache/state.go` for the diagnosis: `Tensor.Bytes()` /
+      `Tensor.Floats()` ↔ `Context.FromBytes(...)` / `FromFloats(...)`
+      round-trip doesn't preserve the backend-specific memory layout
+      ggml/Metal expects for KV cache reads. The puffer load engages
+      (verified via prompt_eval_duration drop on gemma3:1b and
+      qwen3:0.6b) but the restored values decode to garbage. Fix
+      requires either upstream Ollama exposing a backend-faithful
+      tensor codec, OR moving the stash hook into a forward-pass-active
+      context where the cache's own Get/Put primitives are available.
+      This is the next milestone but won't ship in the current branch
+      until the layout issue is solved.
 - [ ] N-replicate stress matrix mirroring the vllm.rs n=8 stress.
 
 ## Related
