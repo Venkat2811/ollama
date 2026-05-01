@@ -203,19 +203,24 @@ func (c *Causal) DeserializeState(data []byte) error {
 		off += 4
 
 		var (
+			kDtype, vDtype ml.DType
 			kShape, vShape []int
 			kBytes, vBytes []byte
 			rerr           error
 		)
-		// readTensor returns f32-encoded bytes regardless of the
-		// original cache dtype — see writeTensor's comment for why.
-		_, kShape, kBytes, off, rerr = readTensor(data, off)
+		kDtype, kShape, kBytes, off, rerr = readTensor(data, off)
 		if rerr != nil {
 			return fmt.Errorf("kvcache: layer %d keys: %w", layer, rerr)
 		}
-		_, vShape, vBytes, off, rerr = readTensor(data, off)
+		vDtype, vShape, vBytes, off, rerr = readTensor(data, off)
 		if rerr != nil {
 			return fmt.Errorf("kvcache: layer %d values: %w", layer, rerr)
+		}
+		if kDtype != c.DType || vDtype != c.DType {
+			return fmt.Errorf(
+				"%w: stash dtype keys=%v values=%v vs cache dtype=%v",
+				ErrDeserializeMismatch, kDtype, vDtype, c.DType,
+			)
 		}
 
 		// Always build a fresh per-layer context. Reusing c.ctxs[layer]
@@ -224,10 +229,24 @@ func (c *Causal) DeserializeState(data []byte) error {
 		layerCtx := c.backend.NewContext().Layer(layer)
 		c.ctxs[layer] = layerCtx
 
-		kFloats := bytesToF32(kBytes)
-		vFloats := bytesToF32(vBytes)
-		c.keys[layer] = layerCtx.FromFloats(kFloats, kShape...)
-		c.values[layer] = layerCtx.FromFloats(vFloats, vShape...)
+		// Stride-preserving restore. The runner reads keys/values via
+		// Causal.Get's View(... key.Stride(1), key.Stride(2) ...) —
+		// the strides depend on the tensor's underlying allocation
+		// layout. Going through Context.FromBytes(dtype, bytes,
+		// shape) builds a fresh tensor whose strides may not match
+		// what Causal.Put's Zeros allocated, so View() reads land at
+		// wrong offsets → garbage KV → garbage decoded tokens.
+		//
+		// Allocating via the same Zeros call Causal.Put uses
+		// guarantees the strides match; we then bytes-fill in place
+		// via Tensor.FromBytes.
+		kT := layerCtx.Zeros(c.DType, kShape...)
+		kT.FromBytes(kBytes)
+		c.keys[layer] = kT
+
+		vT := layerCtx.Zeros(c.DType, vShape...)
+		vT.FromBytes(vBytes)
+		c.values[layer] = vT
 	}
 
 	return nil

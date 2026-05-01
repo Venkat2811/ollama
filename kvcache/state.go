@@ -87,38 +87,31 @@ func dtypeFromCode(code uint8) (ml.DType, error) {
 
 // writeTensor appends [dtype:u8, ndim:u8, shape:u32×ndim, nbytes:u64, data:nbytes].
 //
-// Always written as float32 to make the wire format backend-independent.
-// Backend-native byte layouts (Metal-padded F16, Q8/Q4 packed, etc.) differ
-// from what `Context.FromBytes(dtype, bytes, shape)` re-allocates, so a
-// raw `tensor.Bytes()` round-trip restores tensors that decode to garbage
-// on Metal. Floats() forces a backend-managed conversion to dense f32 and
-// FromFloats reconstructs cleanly. We pay a 2× size hit on F16 caches in
-// exchange for correctness; future work could use a backend-versioned
-// codec for the layout-equivalent fast path.
+// Stores the tensor's native bytes (whatever ml.Tensor.Bytes returns
+// for the cache's working dtype). Restore on the same backend that
+// produced them. Cross-backend round-trip is NOT guaranteed by this
+// codec — different backends may use different in-memory layouts.
+//
+// Pairs with the deserialize path's
+// `ctx.Zeros(dtype, shape...)` + `tensor.FromBytes(...)` strategy:
+// pre-allocate with a layout the runner expects (matches what
+// Causal.Put used) then bytes-fill in place.
 func writeTensor(buf []byte, t ml.Tensor) ([]byte, error) {
-	// We deliberately ignore t.DType() in the wire format: serialize as
-	// f32 always so the stash is portable. The receiving side hands the
-	// f32 array back to FromFloats which casts to the cache's working
-	// dtype.
-	floats := t.Floats()
+	dc, err := dtypeCode(t.DType())
+	if err != nil {
+		return nil, err
+	}
+	bytes := t.Bytes()
 	shape := t.Shape()
 	header := make([]byte, 2+4*len(shape)+8)
-	header[0] = 1 // dtype f32
+	header[0] = dc
 	header[1] = uint8(len(shape))
 	for i, d := range shape {
 		binary.LittleEndian.PutUint32(header[2+4*i:], uint32(d))
 	}
-	nbytes := len(floats) * 4
-	binary.LittleEndian.PutUint64(header[2+4*len(shape):], uint64(nbytes))
+	binary.LittleEndian.PutUint64(header[2+4*len(shape):], uint64(len(bytes)))
 	buf = append(buf, header...)
-	// Append the f32 bytes via math.Float32bits. (We could
-	// reinterpret-cast the slice via unsafe, but the explicit copy is
-	// portable and the codec is one-shot per request.)
-	for _, f := range floats {
-		var b [4]byte
-		binary.LittleEndian.PutUint32(b[:], math.Float32bits(f))
-		buf = append(buf, b[:]...)
-	}
+	buf = append(buf, bytes...)
 	return buf, nil
 }
 
@@ -131,6 +124,95 @@ func bytesToF32(b []byte) []float32 {
 		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
 	}
 	return out
+}
+
+// f32BytesToCacheBytes converts the wire-format f32 bytes (one of two
+// per-tensor blobs in the state) back into the cache's working-dtype
+// byte representation, ready to be passed to Tensor.FromBytes on a
+// pre-allocated Zeros'd tensor with matching shape.
+//
+// Splitting this from the deserialize hot loop keeps the dispatch
+// table in one place — adding a new dtype (e.g. Q5_K, Q4_K_M) only
+// changes this function.
+func f32BytesToCacheBytes(kBytes, vBytes []byte, dtype ml.DType) (
+	[]byte, []byte, error,
+) {
+	switch dtype {
+	case ml.DTypeF32:
+		return kBytes, vBytes, nil
+	case ml.DTypeF16:
+		return f32BytesToF16Bytes(kBytes), f32BytesToF16Bytes(vBytes), nil
+	}
+	// Quantized formats (Q8_0, Q4_0) round-trip the f32 -> quant
+	// encoding too; defer until we actually have a model that
+	// needs it.
+	return nil, nil, fmt.Errorf(
+		"kvcache: state codec restore for dtype %v not implemented", dtype,
+	)
+}
+
+// f32BytesToF16Bytes packs a stream of f32-bytes into IEEE 754 f16
+// using a fast bit-level conversion. The output buffer is half the
+// length of the input.
+func f32BytesToF16Bytes(in []byte) []byte {
+	n := len(in) / 4
+	out := make([]byte, n*2)
+	for i := 0; i < n; i++ {
+		bits := binary.LittleEndian.Uint32(in[i*4:])
+		f16 := f32BitsToF16Bits(bits)
+		binary.LittleEndian.PutUint16(out[i*2:], f16)
+	}
+	return out
+}
+
+// f32BitsToF16Bits implements the round-to-nearest-even conversion
+// from IEEE 754 binary32 to binary16. Handles +/- inf, NaN,
+// subnormals, and overflow saturation. Equivalent to the table-based
+// conversions in encoding/binary's f16 helper, written inline so we
+// don't pick up another dep.
+func f32BitsToF16Bits(f uint32) uint16 {
+	sign := uint16((f >> 31) & 0x1)
+	expF := int32((f >> 23) & 0xFF)
+	mantF := f & 0x007FFFFF
+
+	switch expF {
+	case 255:
+		// inf or NaN
+		if mantF != 0 {
+			// NaN: keep at least one mantissa bit set
+			return uint16((sign << 15) | 0x7C00 | uint16((mantF>>13)&0x3FF) | 0x0001)
+		}
+		return uint16((sign << 15) | 0x7C00)
+	case 0:
+		// zero or subnormal — round to f16 zero
+		return uint16(sign << 15)
+	}
+
+	expH := expF - 127 + 15
+	if expH >= 31 {
+		// overflow → inf
+		return uint16((sign << 15) | 0x7C00)
+	}
+	if expH <= 0 {
+		// underflow / subnormal in f16 — flush to zero (same posture
+		// as ggml's quick conversion)
+		return uint16(sign << 15)
+	}
+
+	// round-to-nearest-even on the dropped 13 bits
+	mantH := uint16(mantF >> 13)
+	round := mantF & 0x00001FFF
+	if round > 0x1000 || (round == 0x1000 && (mantH&1) != 0) {
+		mantH++
+		if mantH == 0x400 {
+			mantH = 0
+			expH++
+			if expH >= 31 {
+				return uint16((sign << 15) | 0x7C00)
+			}
+		}
+	}
+	return uint16((sign << 15) | (uint16(expH) << 10) | mantH)
 }
 
 // readTensor reads a [dtype, ndim, shape, nbytes, data] header back out.
