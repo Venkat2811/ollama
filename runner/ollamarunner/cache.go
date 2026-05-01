@@ -117,6 +117,20 @@ type InputCacheSlot struct {
 	// or this is a fully cold request. Reset to -1 in NewInputCache and
 	// after the runner consumes the token.
 	PendingFirstToken int32
+
+	// Tensorpuffer response-cache signaling.
+	//
+	// When the response sidecar hits during tryLoadFromPuffer (gated by
+	// TPUF_KVBM_STASH_RESPONSE=1), the full generated token sequence
+	// from the original cold run is loaded here. The http handler in
+	// runner.go reads this on LoadCacheSlot return: if non-nil, it
+	// decodes the tokens via the tokenizer and emits the entire response
+	// directly to the caller without ever invoking the model — full
+	// memoization for byte-identical prompt + deterministic decode.
+	//
+	// nil means "no response cached" (sidecar missed or feature off).
+	// Reset to nil on slot reuse.
+	PendingResponse []int32
 }
 
 func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*InputCacheSlot, []*input.Input, error) {

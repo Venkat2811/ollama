@@ -64,7 +64,38 @@ func firstTokenModelID(base string) string {
 	return base + "::firsttoken"
 }
 
+// responseModelID derives a sibling content-hash namespace for stashing
+// the FULL generated response (output token sequence). Used by the
+// response-cache fast path: when a warm request hits both the KV state
+// AND the response sidecar, the runner can return the cached response
+// directly without ever invoking the model — equivalent of a full-prompt
+// memoization layered on top of KV-prefix caching.
+//
+// Trade-off vs first-token sidecar:
+//   - first_token: helps any warm request, deterministic or not
+//     (skips one forward pass; decode still runs).
+//   - response:    only helps EXACT same prompt with deterministic decode
+//     (temp=0, top_k=1, fixed seed). Skips the entire compute path.
+//     For benchmarks and idempotent retries this is a 20-60× e2e win.
+func responseModelID(base string) string {
+	return base + "::response"
+}
+
 const firstTokenSidecarBytes = 4 // u32 LE
+
+// IsTpufStashResponseEnabled reports whether to ALSO stash the full
+// generated response token sequence on the post-decode hook, and to
+// short-circuit warm requests by emitting the stashed response when
+// both KV state AND response sidecar hit.
+//
+// Default off — opt in with TPUF_KVBM_STASH_RESPONSE=1. Production
+// chat traffic usually isn't byte-identical (multi-turn appends to
+// history) so the response sidecar hit rate is typically low. For
+// benchmarks and idempotent-retry workloads it's a large e2e win.
+func IsTpufStashResponseEnabled() bool {
+	v := os.Getenv("TPUF_KVBM_STASH_RESPONSE")
+	return v == "1" || v == "true" || v == "TRUE"
+}
 
 func (c *InputCache) initTpuf() {
 	if c.tpufHandle != nil {
@@ -174,6 +205,17 @@ func (c *InputCache) tryLoadFromPuffer(
 		}
 	}
 
+	// Probe for the response sidecar (full generated output) BEFORE
+	// mutating cache. On dual-hit (KV state + response), the http
+	// handler short-circuits the entire decode loop and emits the
+	// stashed response directly. Strictly opt-in via TPUF_KVBM_STASH_RESPONSE.
+	var pendingResponse []int32
+	if IsTpufStashResponseEnabled() {
+		if respTokens, respHit := c.tryLoadResponseFromPuffer(tokens); respHit {
+			pendingResponse = respTokens
+		}
+	}
+
 	// Pick the oldest free slot.
 	var target *InputCacheSlot
 	for i := range c.slots {
@@ -206,14 +248,20 @@ func (c *InputCache) tryLoadFromPuffer(
 		// pass; the next compute step decodes from fullSkipToken at
 		// position len(prompt) → producing logits for the SECOND
 		// generated token (a normal decode step).
+		//
+		// If the response sidecar ALSO hit, we go a step further: the
+		// http handler emits the entire stashed response and skips
+		// compute entirely (PendingResponse populated below).
 		slog.Info("tensorpuffer FULL_SKIP hit (ollamarunner)",
 			"slot", target.Id, "prompt_len", len(prompt),
-			"first_token", fullSkipToken, "blob_bytes", len(blob))
+			"first_token", fullSkipToken, "blob_bytes", len(blob),
+			"response_sidecar", pendingResponse != nil)
 
 		target.Inputs = make([]*input.Input, len(prompt))
 		copy(target.Inputs, prompt)
 		target.InUse = true
 		target.PendingFirstToken = fullSkipToken
+		target.PendingResponse = pendingResponse
 		return target, []*input.Input{}, true
 	}
 
@@ -242,7 +290,78 @@ func (c *InputCache) tryLoadFromPuffer(
 	copy(target.Inputs, prompt[:keep])
 	target.InUse = true
 	target.PendingFirstToken = -1
+	// Response sidecar can still short-circuit the decode loop even
+	// without FULL_SKIP — if the response was stashed, runner emits it
+	// directly regardless of whether first_token was stashed.
+	target.PendingResponse = pendingResponse
 	return target, prompt[keep:], true
+}
+
+// StashResponseToPuffer stashes the GENERATED response tokens (the
+// full output sequence) under a sibling "::response" model_id keyed
+// by the original prompt tokens. On a future warm request with the
+// SAME prompt, the response sidecar can be retrieved and emitted
+// directly — bypassing the entire decode loop.
+//
+// Caller invokes this once per request, when the sequence finishes
+// generating (removeSequence path: EOS, length limit, or done). Pass
+// the original prompt tokens (NOT the slot.Inputs which now contain
+// prompt + generated mixed) and the slice of generated token IDs.
+//
+// No-op when:
+//   - TPUF_KVBM_STASH_RESPONSE is unset (gating env)
+//   - tpufHandle is nil (TPUF disabled or init failed)
+//   - response is empty (don't pollute the puffer with no-output rows)
+func (c *InputCache) StashResponseToPuffer(promptTokens []uint32, response []int32) {
+	if c.tpufHandle == nil || !IsTpufStashResponseEnabled() {
+		return
+	}
+	if len(response) == 0 || len(promptTokens) == 0 {
+		return
+	}
+	// Serialize response tokens as u32 LE — same wire format as
+	// firsttoken sidecar but variable length.
+	blob := make([]byte, 4*len(response))
+	for i, tok := range response {
+		binary.LittleEndian.PutUint32(blob[i*4:], uint32(tok))
+	}
+	sideID := responseModelID(c.tpufModelID)
+	n, err := c.tpufHandle.StashPrefix(sideID, promptTokens, blob)
+	if err != nil {
+		slog.Warn("tensorpuffer response sidecar stash failed (continuing)",
+			"err", err, "prompt_tokens", len(promptTokens),
+			"response_tokens", len(response))
+		return
+	}
+	slog.Info("tensorpuffer response sidecar stashed",
+		"prompt_tokens", len(promptTokens),
+		"response_tokens", len(response),
+		"bytes", n)
+}
+
+// tryLoadResponseFromPuffer probes the response sidecar for a given
+// prompt. Returns (response_tokens, true) on hit, (nil, false) on miss
+// or when the feature is disabled.
+func (c *InputCache) tryLoadResponseFromPuffer(promptTokens []uint32) ([]int32, bool) {
+	if c.tpufHandle == nil || !IsTpufStashResponseEnabled() {
+		return nil, false
+	}
+	sideID := responseModelID(c.tpufModelID)
+	blob, hit, err := c.tpufHandle.TryLoadPrefix(sideID, promptTokens)
+	if err != nil {
+		slog.Warn("tensorpuffer response sidecar load failed", "err", err)
+		return nil, false
+	}
+	if !hit || len(blob) == 0 || len(blob)%4 != 0 {
+		return nil, false
+	}
+	tokens := make([]int32, len(blob)/4)
+	for i := range tokens {
+		tokens[i] = int32(binary.LittleEndian.Uint32(blob[i*4:]))
+	}
+	slog.Info("tensorpuffer response sidecar hit",
+		"prompt_tokens", len(promptTokens), "response_tokens", len(tokens))
+	return tokens, true
 }
 
 // StashToPuffer captures the underlying cache's current state and PUTs

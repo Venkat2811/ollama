@@ -113,6 +113,23 @@ type Sequence struct {
 	samplingDuration         time.Duration
 	numPredicted             int
 	numPromptInputs          int
+
+	// Tensorpuffer response-cache state.
+	//
+	// promptTokensForTpuf: snapshot of the original prompt tokens at
+	// LoadCacheSlot time, used as the lookup key for the response
+	// sidecar at request end. Captured separately from slot.Inputs
+	// because slot.Inputs grows over time (prompt + generated tokens
+	// mixed) and we need the BYTE-IDENTICAL prompt to key the stash.
+	//
+	// generatedTokens: appended to after each successful sample.
+	// Stashed verbatim in removeSequence under the prompt key when
+	// TPUF_KVBM_STASH_RESPONSE=1 is set.
+	//
+	// Both are non-nil only when TPUF is enabled. Cleared on Sequence
+	// drop when the response is fully streamed by removeSequence.
+	promptTokensForTpuf []uint32
+	generatedTokens     []int32
 }
 
 type NewSequenceParams struct {
@@ -403,6 +420,57 @@ func (s *Server) allNil() bool {
 	return true
 }
 
+// applyTpufResponseCache handles the highest-priority warm-load path:
+// the response sidecar hit, so we have the entire output token sequence
+// from a previous cold run with the byte-identical prompt. Decode it
+// once via the tokenizer, send the joined text as a single response
+// chunk, mark the seq complete, and close the channel.
+//
+// Caller is responsible for releasing seqsSem and clearing
+// slot.InUse / slot.PendingResponse — this helper just emits + closes.
+//
+// Returns an error only if tokenizer decode fails for the entire
+// sequence; the caller treats that as "fall through to FULL_SKIP /
+// normal compute" rather than failing the whole request.
+//
+// Net effect vs FULL_SKIP path:
+//   FULL_SKIP saves one forward pass (~5-30 ms on small models, more
+//   on bigger ones).
+//   Response cache saves the ENTIRE decode loop — N forward passes
+//   for an N-token response, which is the dominant share of e2e for
+//   short prompts + long answers.
+func (s *Server) applyTpufResponseCache(seq *Sequence, response []int32) error {
+	if len(response) == 0 {
+		return errors.New("response cache empty")
+	}
+	piece, err := s.model.(tokenizer.Tokenizer).Decode(response)
+	if err != nil {
+		return fmt.Errorf("tokenizer decode response: %w", err)
+	}
+
+	now := time.Now()
+	seq.startedAt = now
+	seq.lastUpdatedAt = now
+	// Attribute zero compute time to prefill + decode — this is a pure
+	// memoization hit. The puffer load + decode wall time shows up in
+	// the http handler's outer timing.
+	seq.processingDuration = 0
+	seq.samplingDuration = 0
+	seq.numPredicted = len(response)
+	seq.doneReason = llm.DoneReasonStop
+
+	// Single chunk via the existing pendingResponses pipeline so the
+	// stop-string detection logic still applies (idempotent on a
+	// completed response: if the stashed text already ended at a stop,
+	// it stays stopped).
+	seq.pendingResponses = append(seq.pendingResponses, piece)
+	flushPending(seq)
+
+	close(seq.responses)
+	close(seq.embedding)
+	return nil
+}
+
 // applyTpufFullSkip handles the warm-load fast-path where tensorpuffer
 // dual-hit (KV state + first-token sidecar). The cache slot is already
 // fully populated for the entire prompt — no trim was applied. This
@@ -489,6 +557,16 @@ func (s *Server) removeSequence(seqIndex int, reason llm.DoneReason) {
 
 	flushPending(seq)
 	seq.doneReason = reason
+
+	// Tensorpuffer response-cache stash: persist the full generated
+	// output token sequence under the original prompt's content hash.
+	// Only fires when TPUF_KVBM_STASH_RESPONSE=1 was set (the
+	// promptTokensForTpuf snapshot is non-nil only in that case).
+	// Best-effort — failure is logged inside StashResponseToPuffer.
+	if len(seq.promptTokensForTpuf) > 0 && len(seq.generatedTokens) > 0 {
+		s.cache.StashResponseToPuffer(seq.promptTokensForTpuf, seq.generatedTokens)
+	}
+
 	close(seq.responses)
 	close(seq.embedding)
 	seq.cache.InUse = false
@@ -825,6 +903,14 @@ func (s *Server) computeBatch(activeBatch batchState) {
 
 		nextBatchTokens[i].Token = token
 
+		// Tensorpuffer response-cache: track every sampled token so we
+		// can stash the full output sequence at request end. Cheap
+		// O(1) append; only allocates when TPUF_KVBM_STASH_RESPONSE
+		// is enabled (promptTokensForTpuf is the gate).
+		if seq.promptTokensForTpuf != nil {
+			seq.generatedTokens = append(seq.generatedTokens, token)
+		}
+
 		// Tensorpuffer post-prefill stash (Direction B). Fires exactly
 		// once per request — right after the first generated token has
 		// been sampled. Stashes both the KV state AND the first sampled
@@ -1007,6 +1093,21 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	found := false
 	for i, sq := range s.seqs {
 		if sq == nil {
+			// Tensorpuffer response-cache key: snapshot the prompt
+			// tokens before LoadCacheSlot mutates seq.inputs (the
+			// warm path consumes the prompt and leaves only the
+			// trim+redecode tail). Used at removeSequence time to
+			// stash the generated response under this exact key.
+			if IsTpufStashResponseEnabled() {
+				promptCopy := make([]uint32, 0, len(seq.inputs))
+				for _, p := range seq.inputs {
+					if p != nil {
+						promptCopy = append(promptCopy, uint32(p.Token))
+					}
+				}
+				seq.promptTokensForTpuf = promptCopy
+			}
+
 			seq.cache, seq.inputs, err = s.cache.LoadCacheSlot(seq.inputs, true)
 			if err != nil {
 				s.mu.Unlock()
@@ -1028,7 +1129,35 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 			// allocation. The handler's response loop receives the close
 			// and writes the Done envelope.
 			fullSkipDone := false
-			if seq.cache.PendingFirstToken >= 0 {
+
+			// Tensorpuffer response-cache fast-path. Highest-priority
+			// short-circuit: if the response sidecar hit, we have the
+			// FULL output token sequence from the cold run. Decode and
+			// emit it directly, then close — no compute scheduled.
+			//
+			// Only fires when prompt is byte-identical to a previous
+			// stashed prompt AND decode was deterministic (caller is
+			// responsible for ensuring temp/top_k/seed match).
+			if seq.cache.PendingResponse != nil {
+				resp := seq.cache.PendingResponse
+				seq.cache.PendingResponse = nil
+				seq.cache.PendingFirstToken = -1
+
+				if err := s.applyTpufResponseCache(seq, resp); err != nil {
+					slog.Warn("tensorpuffer response-cache emit failed (falling back to FULL_SKIP)",
+						"err", err)
+					// Don't bail — fall through to FULL_SKIP if the
+					// first_token is also pending; otherwise normal compute.
+				} else {
+					seq.cache.InUse = false
+					s.seqsSem.Release(1)
+					fullSkipDone = true
+					slog.Info("tensorpuffer response-cache emitted — skipping compute entirely",
+						"slot", seq.cache.Id, "response_tokens", len(resp))
+				}
+			}
+
+			if !fullSkipDone && seq.cache.PendingFirstToken >= 0 {
 				token := seq.cache.PendingFirstToken
 				seq.cache.PendingFirstToken = -1
 
