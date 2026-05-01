@@ -175,6 +175,45 @@ func (c *InputCache) tryLoadFromPuffer(
 	if !ok {
 		return nil, nil, false
 	}
+
+	// Highest-priority short-circuit: probe the response sidecar FIRST
+	// (cheap — ~4 bytes/token). On hit, we never need the heavy KV state
+	// blob: the http handler will emit the stashed response and skip
+	// compute entirely. Loading the KV state when we won't use it is the
+	// difference between a 200 ms warm hit and a multi-second one when
+	// the blob has been evicted from the foyer RAM tier (e.g. qwen3's
+	// pre-allocated 4.7 GiB cache, which exceeds the 2 GiB RAM budget
+	// and always streams from SSD on subsequent warm hits).
+	if IsTpufStashResponseEnabled() {
+		if respTokens, respHit := c.tryLoadResponseFromPuffer(tokens); respHit {
+			// Pick the oldest free slot. Don't claim a prefix — the slot
+			// is a vehicle to carry PendingResponse; the http handler
+			// emits + closes without ever running compute, and we never
+			// need slot.Inputs / underlying KV state to be consistent.
+			var target *InputCacheSlot
+			for i := range c.slots {
+				s := &c.slots[i]
+				if s.InUse {
+					continue
+				}
+				if target == nil || s.lastUsed.Before(target.lastUsed) {
+					target = s
+				}
+			}
+			if target == nil {
+				slog.Debug("tensorpuffer response-cache hit but no free slot — falling through")
+			} else {
+				target.InUse = true
+				target.PendingFirstToken = -1
+				target.PendingResponse = respTokens
+				slog.Info("tensorpuffer response-cache hit (KV state load skipped)",
+					"slot", target.Id, "prompt_len", len(prompt),
+					"response_tokens", len(respTokens))
+				return target, []*input.Input{}, true
+			}
+		}
+	}
+
 	blob, hit, err := c.tpufHandle.TryLoadPrefix(c.tpufModelID, tokens)
 	if err != nil {
 		slog.Warn("tensorpuffer load failed (falling through)", "err", err)
@@ -202,17 +241,6 @@ func (c *InputCache) tryLoadFromPuffer(
 				"err", ftErr)
 		case ftHit && len(ftBlob) >= firstTokenSidecarBytes:
 			fullSkipToken = int32(binary.LittleEndian.Uint32(ftBlob[:firstTokenSidecarBytes]))
-		}
-	}
-
-	// Probe for the response sidecar (full generated output) BEFORE
-	// mutating cache. On dual-hit (KV state + response), the http
-	// handler short-circuits the entire decode loop and emits the
-	// stashed response directly. Strictly opt-in via TPUF_KVBM_STASH_RESPONSE.
-	var pendingResponse []int32
-	if IsTpufStashResponseEnabled() {
-		if respTokens, respHit := c.tryLoadResponseFromPuffer(tokens); respHit {
-			pendingResponse = respTokens
 		}
 	}
 
@@ -248,20 +276,15 @@ func (c *InputCache) tryLoadFromPuffer(
 		// pass; the next compute step decodes from fullSkipToken at
 		// position len(prompt) → producing logits for the SECOND
 		// generated token (a normal decode step).
-		//
-		// If the response sidecar ALSO hit, we go a step further: the
-		// http handler emits the entire stashed response and skips
-		// compute entirely (PendingResponse populated below).
 		slog.Info("tensorpuffer FULL_SKIP hit (ollamarunner)",
 			"slot", target.Id, "prompt_len", len(prompt),
-			"first_token", fullSkipToken, "blob_bytes", len(blob),
-			"response_sidecar", pendingResponse != nil)
+			"first_token", fullSkipToken, "blob_bytes", len(blob))
 
 		target.Inputs = make([]*input.Input, len(prompt))
 		copy(target.Inputs, prompt)
 		target.InUse = true
 		target.PendingFirstToken = fullSkipToken
-		target.PendingResponse = pendingResponse
+		target.PendingResponse = nil
 		return target, []*input.Input{}, true
 	}
 
@@ -290,10 +313,7 @@ func (c *InputCache) tryLoadFromPuffer(
 	copy(target.Inputs, prompt[:keep])
 	target.InUse = true
 	target.PendingFirstToken = -1
-	// Response sidecar can still short-circuit the decode loop even
-	// without FULL_SKIP — if the response was stashed, runner emits it
-	// directly regardless of whether first_token was stashed.
-	target.PendingResponse = pendingResponse
+	target.PendingResponse = nil
 	return target, prompt[keep:], true
 }
 
