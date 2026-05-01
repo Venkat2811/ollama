@@ -403,6 +403,59 @@ func (s *Server) allNil() bool {
 	return true
 }
 
+// applyTpufFullSkip handles the warm-load fast-path where tensorpuffer
+// dual-hit (KV state + first-token sidecar). The cache slot is already
+// fully populated for the entire prompt — no trim was applied. This
+// helper:
+//
+//   - Decodes the stashed first token to a piece, pushes it to
+//     pendingResponses, and flushes so the http handler can stream it
+//     immediately (the handler hasn't entered its response loop yet, but
+//     the response channel is buffered to 100 so the send doesn't block).
+//   - Marks numPredicted=1 so the next compute iteration treats this seq
+//     as already past prefill (no-op-ing the post-prefill stash hook).
+//   - Queues first_token as seq.inputs[0] so the next forward pass
+//     operates at position len(prompt) — a normal decode of
+//     (first_token → second_token).
+//
+// Caller must have verified token is NOT EOS (EOS first_token is handled
+// inline at the LoadCacheSlot call site so no compute is scheduled).
+//
+// Net effect vs the regular trim+redecode warm path: saves exactly one
+// forward pass (the trim's 1-token re-decode that produces first_token's
+// logits). Mirrors vllm.rs's FULL_SKIP semantics in spirit, though the
+// magnitude differs: vllm.rs's TRY_LOAD-only mode runs a full prefill
+// kernel even with cached blocks (so its FULL_SKIP saves a much heavier
+// pass), whereas ollamarunner's regular warm path already runs only a
+// 1-token forward.
+func (s *Server) applyTpufFullSkip(seq *Sequence, token int32) {
+	seq.numPredicted = 1
+	now := time.Now()
+	seq.startedAt = now
+	seq.lastUpdatedAt = now
+	// FULL_SKIP attributes zero compute time to prefill. The puffer
+	// load + state restore wall time is captured by the http handler's
+	// outer timing.
+	seq.processingDuration = 0
+
+	piece, err := s.model.(tokenizer.Tokenizer).Decode([]int32{token})
+	if err != nil {
+		slog.Warn("tensorpuffer FULL_SKIP first_token decode failed (continuing without piece)",
+			"err", err, "token", token)
+	} else {
+		seq.pendingResponses = append(seq.pendingResponses, piece)
+		flushPending(seq)
+	}
+
+	// Queue first_token as the next decode input. The next compute
+	// step runs Forward on this token at position len(prompt),
+	// producing logits for the second generated token.
+	seq.inputs = []*input.Input{{Token: token}}
+
+	slog.Info("tensorpuffer FULL_SKIP applied", "slot", seq.cache.Id,
+		"first_token", token)
+}
+
 func flushPending(seq *Sequence) bool {
 	joined := strings.Join(seq.pendingResponses, "")
 	logprobs := seq.pendingLogprobs
@@ -748,15 +801,10 @@ func (s *Server) computeBatch(activeBatch batchState) {
 
 		seq.lastUpdatedAt = t
 		seq.numPredicted++
-		if seq.numPredicted == 1 {
+		firstSample := seq.numPredicted == 1
+		if firstSample {
 			seq.processingDuration = seq.lastUpdatedAt.Sub(seq.startedAt)
 			seq.startedAt = seq.lastUpdatedAt
-			// Tensorpuffer post-prefill stash (Direction B). Fires
-			// exactly once per request — when prefill just completed
-			// and the first sample landed. No-op when the underlying
-			// cache type doesn't implement SerializableCache or
-			// TPUF_KVBM_ENABLE is unset.
-			s.cache.StashToPuffer(seq.cache)
 		}
 
 		// if done processing the prompt, generate an embedding and return
@@ -776,6 +824,22 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		}
 
 		nextBatchTokens[i].Token = token
+
+		// Tensorpuffer post-prefill stash (Direction B). Fires exactly
+		// once per request — right after the first generated token has
+		// been sampled. Stashes both the KV state AND the first sampled
+		// token so a future warm load can FULL_SKIP the post-prefill
+		// 1-token forward pass. No-op when the underlying cache type
+		// doesn't implement SerializableCache or TPUF_KVBM_ENABLE is
+		// unset; sidecar stash is gated by TPUF_KVBM_FULL_SKIP separately.
+		//
+		// Stashes regardless of EOS — the cache state is valid even when
+		// the first sample is EOS (cold run produced no content but the
+		// state is reusable; warm load detects EOS first_token and
+		// terminates without compute).
+		if firstSample {
+			s.cache.StashToPuffer(seq.cache, token)
+		}
 
 		// if it's an end of sequence token, break
 		if s.model.(tokenizer.Tokenizer).Is(token, tokenizer.SpecialEOS) {
@@ -951,8 +1015,42 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			s.seqs[i] = seq
-			s.cond.Signal()
+			// Tensorpuffer FULL_SKIP fast-path. tryLoadFromPuffer dual-
+			// hit (KV state + first-token sidecar): emit the stashed
+			// first token to the caller now, queue it as seq.inputs so
+			// the next compute step is a normal decode of (first_token
+			// → second_token). Saves exactly one forward pass relative
+			// to the regular trim+redecode warm path.
+			//
+			// On EOS first_token, mirror the cold-run termination path:
+			// emit Done immediately without ever scheduling compute for
+			// this seq, and release the semaphore + skip the s.seqs slot
+			// allocation. The handler's response loop receives the close
+			// and writes the Done envelope.
+			fullSkipDone := false
+			if seq.cache.PendingFirstToken >= 0 {
+				token := seq.cache.PendingFirstToken
+				seq.cache.PendingFirstToken = -1
+
+				if s.model.(tokenizer.Tokenizer).Is(token, tokenizer.SpecialEOS) {
+					seq.doneReason = llm.DoneReasonStop
+					seq.numPredicted = 1
+					seq.processingDuration = 0
+					close(seq.responses)
+					seq.cache.InUse = false
+					s.seqsSem.Release(1)
+					fullSkipDone = true
+					slog.Info("tensorpuffer FULL_SKIP first_token=EOS — no compute issued",
+						"slot", seq.cache.Id)
+				} else {
+					s.applyTpufFullSkip(seq, token)
+				}
+			}
+
+			if !fullSkipDone {
+				s.seqs[i] = seq
+				s.cond.Signal()
+			}
 			found = true
 			break
 		}

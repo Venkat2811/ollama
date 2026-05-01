@@ -48,7 +48,7 @@ func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots
 	slots := make([]InputCacheSlot, numSlots)
 
 	for i := range slots {
-		slots[i] = InputCacheSlot{Id: i}
+		slots[i] = InputCacheSlot{Id: i, PendingFirstToken: -1}
 	}
 
 	cache := model.Config().Cache
@@ -100,6 +100,23 @@ type InputCacheSlot struct {
 
 	// last time this cache was used (as of start of processing)
 	lastUsed time.Time
+
+	// Tensorpuffer FULL_SKIP signaling.
+	//
+	// When tryLoadFromPuffer dual-hits (KV state AND first-token sidecar),
+	// it leaves the KV cache fully populated for the entire prompt (no
+	// trim) and writes the stashed first sampled token here. The runner's
+	// completion handler then short-circuits the post-prefill 1-token
+	// forward pass: it emits PendingFirstToken to the caller, sets
+	// numPredicted to 1, hands seq.inputs the first token so the next
+	// compute step is a normal decode, and clears PendingFirstToken back
+	// to -1.
+	//
+	// -1 means "no pending token" — either the warm path took the trim+
+	// redecode shape (tryLoadFromPuffer hit on KV but missed the sidecar)
+	// or this is a fully cold request. Reset to -1 in NewInputCache and
+	// after the runner consumes the token.
+	PendingFirstToken int32
 }
 
 func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*InputCacheSlot, []*input.Input, error) {
