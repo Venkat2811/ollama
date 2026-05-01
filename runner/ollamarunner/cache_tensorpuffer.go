@@ -124,6 +124,116 @@ func IsTpufAsyncStashEnabled() bool {
 	return v == "1" || v == "true" || v == "TRUE"
 }
 
+// IsTpufNativeFastPathEnabled reports whether to skip the heavy puffer
+// KV-state probe when the in-memory cache already has a full prompt
+// prefix match.
+//
+// Rationale: the in-memory cache is faster than any tier the puffer
+// can serve from. If a slot already advertises slot.Inputs == prompt,
+// we can fall through to the native warm path (trim + re-decode last
+// token) without ever touching the puffer's KV-state blob. The cheap
+// response-sidecar probe still fires first — it can short-circuit the
+// entire decode loop on byte-identical replays.
+//
+// Skipped probes are pure latency wins:
+//   - For qwen3 (4.7 GiB KV blob), the probe is ~250-350 ms even on
+//     warm-foyer-RAM hits, climbing past 3 s when the blob is evicted
+//     to SSD-only.
+//   - For gemma3 (~157 MB), the probe is ~30-50 ms.
+//
+// Doesn't change semantics — the in-memory path's outcome is identical
+// to (or better than) the puffer KV-restore path when native already
+// has full prefix.
+//
+// Default off — opt in with TPUF_KVBM_NATIVE_FAST_PATH=1. Will likely
+// become default-on after broader testing.
+func IsTpufNativeFastPathEnabled() bool {
+	v := os.Getenv("TPUF_KVBM_NATIVE_FAST_PATH")
+	return v == "1" || v == "true" || v == "TRUE"
+}
+
+// hasFullNativeMatch reports whether any free slot's slot.Inputs is a
+// full prefix match of the requested prompt — i.e. countCommonPrefix
+// equals len(prompt). Used by tryLoadFromPuffer to skip the heavy KV-
+// state probe when native already has the data.
+//
+// Caller must hold the same lock that protects InputCacheSlot.InUse /
+// .Inputs (today: handler-side s.mu). LoadCacheSlot already holds it.
+func (c *InputCache) hasFullNativeMatch(prompt []*input.Input) bool {
+	for i := range c.slots {
+		s := &c.slots[i]
+		if s.InUse {
+			continue
+		}
+		if countCommonPrefix(s.Inputs, prompt) == int32(len(prompt)) {
+			return true
+		}
+	}
+	return false
+}
+
+// tryNativeFastPathFullSkip claims the slot that already has a full
+// prompt match in its slot.Inputs, fetches the cheap first-token
+// sidecar from the puffer, and returns the slot configured for the
+// FULL_SKIP shape — same wiring as tryLoadFromPuffer's regular FULL_SKIP
+// path, just without the heavy DeserializeState because native already
+// has the data.
+//
+// Returns (slot, true) on success or (nil, false) on:
+//   - No matching free slot (race with another goroutine)
+//   - First-token sidecar miss (we'd have to fall back to trim+redecode)
+//   - First-token sidecar load error
+//   - cache.Remove trim failure (defensive — keep slot.Inputs consistent)
+//
+// On failure, the caller should fall through to the normal in-memory
+// path; we deliberately don't try the puffer's KV-state probe since
+// native already has the data and the probe would only add latency.
+func (c *InputCache) tryNativeFastPathFullSkip(prompt []*input.Input, tokens []uint32) (*InputCacheSlot, bool) {
+	var target *InputCacheSlot
+	for i := range c.slots {
+		s := &c.slots[i]
+		if s.InUse {
+			continue
+		}
+		if countCommonPrefix(s.Inputs, prompt) == int32(len(prompt)) {
+			target = s
+			break
+		}
+	}
+	if target == nil {
+		return nil, false
+	}
+
+	sideID := firstTokenModelID(c.tpufModelID)
+	ftBlob, ftHit, ftErr := c.tpufHandle.TryLoadPrefix(sideID, tokens)
+	if ftErr != nil || !ftHit || len(ftBlob) < firstTokenSidecarBytes {
+		return nil, false
+	}
+	firstToken := int32(binary.LittleEndian.Uint32(ftBlob[:firstTokenSidecarBytes]))
+
+	// Trim any KV state beyond len(prompt) — slot.Inputs may be longer
+	// than the current prompt (we matched a prefix of it). The runner's
+	// FULL_SKIP shape expects slot.Inputs and KV state to align at
+	// len(prompt) so the next forward pass at position len(prompt)
+	// reads the correct attention history.
+	if len(target.Inputs) > len(prompt) && c.cache != nil {
+		if err := c.cache.Remove(target.Id, int32(len(prompt)), math.MaxInt32); err != nil {
+			slog.Warn("tensorpuffer native fast-path trim failed — falling through",
+				"slot", target.Id, "err", err)
+			return nil, false
+		}
+	}
+
+	target.Inputs = make([]*input.Input, len(prompt))
+	copy(target.Inputs, prompt)
+	target.InUse = true
+	target.PendingFirstToken = firstToken
+	target.PendingResponse = nil
+	slog.Info("tensorpuffer native fast-path FULL_SKIP (no KV probe)",
+		"slot", target.Id, "prompt_len", len(prompt), "first_token", firstToken)
+	return target, true
+}
+
 func (c *InputCache) initTpuf() {
 	if c.tpufHandle != nil {
 		return
@@ -239,6 +349,25 @@ func (c *InputCache) tryLoadFromPuffer(
 				return target, []*input.Input{}, true
 			}
 		}
+	}
+
+	// Native fast path: if a free in-memory slot already advertises the
+	// full prompt, the puffer's KV-state load can't beat what's in VRAM.
+	// Skip the heavy probe but still pull the cheap first-token sidecar
+	// (4 bytes) so we can take the FULL_SKIP shape from native — saves
+	// the ~30 ms (gemma3) to ~250 ms-3 s (qwen3) KV-state load AND avoids
+	// the post-prefill re-stash (1.5 s for qwen3) that the trim+redecode
+	// fallback would otherwise pay.
+	if IsTpufNativeFastPathEnabled() && IsTpufFullSkipEnabled() && c.hasFullNativeMatch(prompt) {
+		if target, ok := c.tryNativeFastPathFullSkip(prompt, tokens); ok {
+			return target, []*input.Input{}, true
+		}
+		// First-token sidecar miss: fall through to normal in-memory path.
+		// We deliberately do NOT take the puffer's KV probe — native already
+		// has the data, the probe would only add latency. The cost is the
+		// in-memory trim+redecode path's 1 forward pass + post-prefill
+		// re-stash (worth it on the rare miss).
+		return nil, nil, false
 	}
 
 	blob, hit, err := c.tpufHandle.TryLoadPrefix(c.tpufModelID, tokens)
