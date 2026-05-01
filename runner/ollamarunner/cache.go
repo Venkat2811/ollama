@@ -7,6 +7,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/ollama/ollama/integrations/tensorpuffer"
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model"
@@ -29,6 +30,12 @@ type InputCache struct {
 	multiUserCache bool
 
 	cache kvcache.Cache
+
+	// Tensorpuffer integration (Direction B). Both fields are nil/""
+	// unless TPUF_KVBM_ENABLE=1 AND the underlying cache implements
+	// kvcache.SerializableCache. See cache_tensorpuffer.go.
+	tpufHandle  *tensorpuffer.Handle
+	tpufModelID string
 }
 
 func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool) (*InputCache, error) {
@@ -49,13 +56,15 @@ func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots
 		cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
 	}
 
-	return &InputCache{
+	c := &InputCache{
 		numCtx:         numCtx,
 		enabled:        cache != nil,
 		slots:          slots,
 		multiUserCache: multiUserCache,
 		cache:          cache,
-	}, nil
+	}
+	c.initTpuf()
+	return c, nil
 }
 
 func kvCacheTypeFromStr(s string) ml.DType {
@@ -97,6 +106,15 @@ func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*In
 	var slot *InputCacheSlot
 	var numPast int32
 	var err error
+
+	// Tensorpuffer fast-path (Direction B): probe the puffer for an
+	// exact match before scanning in-memory slots. Falls through on
+	// miss / unsupported cache type / restore failure. The cache's
+	// own backend constructs the restored tensors, so no ml.Context
+	// from the runner is needed here.
+	if tpufSlot, tpufRem, ok := c.tryLoadFromPuffer(prompt, cachePrompt); ok {
+		return tpufSlot, tpufRem, nil
+	}
 
 	// In single-user scenarios, the longest cache slot works fine for getting good input
 	// cache hit rates and it keeps the footprint of the cache small, which improves throughput.

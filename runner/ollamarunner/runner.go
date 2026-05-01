@@ -751,6 +751,12 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		if seq.numPredicted == 1 {
 			seq.processingDuration = seq.lastUpdatedAt.Sub(seq.startedAt)
 			seq.startedAt = seq.lastUpdatedAt
+			// Tensorpuffer post-prefill stash (Direction B). Fires
+			// exactly once per request — when prefill just completed
+			// and the first sample landed. No-op when the underlying
+			// cache type doesn't implement SerializableCache or
+			// TPUF_KVBM_ENABLE is unset.
+			s.cache.StashToPuffer(seq.cache)
 		}
 
 		// if done processing the prompt, generate an embedding and return
