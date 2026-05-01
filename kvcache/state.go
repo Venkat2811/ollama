@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/ollama/ollama/ml"
 )
@@ -85,23 +86,51 @@ func dtypeFromCode(code uint8) (ml.DType, error) {
 }
 
 // writeTensor appends [dtype:u8, ndim:u8, shape:u32×ndim, nbytes:u64, data:nbytes].
+//
+// Always written as float32 to make the wire format backend-independent.
+// Backend-native byte layouts (Metal-padded F16, Q8/Q4 packed, etc.) differ
+// from what `Context.FromBytes(dtype, bytes, shape)` re-allocates, so a
+// raw `tensor.Bytes()` round-trip restores tensors that decode to garbage
+// on Metal. Floats() forces a backend-managed conversion to dense f32 and
+// FromFloats reconstructs cleanly. We pay a 2× size hit on F16 caches in
+// exchange for correctness; future work could use a backend-versioned
+// codec for the layout-equivalent fast path.
 func writeTensor(buf []byte, t ml.Tensor) ([]byte, error) {
-	dc, err := dtypeCode(t.DType())
-	if err != nil {
-		return nil, err
-	}
+	// We deliberately ignore t.DType() in the wire format: serialize as
+	// f32 always so the stash is portable. The receiving side hands the
+	// f32 array back to FromFloats which casts to the cache's working
+	// dtype.
+	floats := t.Floats()
 	shape := t.Shape()
-	bytesData := t.Bytes()
 	header := make([]byte, 2+4*len(shape)+8)
-	header[0] = dc
+	header[0] = 1 // dtype f32
 	header[1] = uint8(len(shape))
 	for i, d := range shape {
 		binary.LittleEndian.PutUint32(header[2+4*i:], uint32(d))
 	}
-	binary.LittleEndian.PutUint64(header[2+4*len(shape):], uint64(len(bytesData)))
+	nbytes := len(floats) * 4
+	binary.LittleEndian.PutUint64(header[2+4*len(shape):], uint64(nbytes))
 	buf = append(buf, header...)
-	buf = append(buf, bytesData...)
+	// Append the f32 bytes via math.Float32bits. (We could
+	// reinterpret-cast the slice via unsafe, but the explicit copy is
+	// portable and the codec is one-shot per request.)
+	for _, f := range floats {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], math.Float32bits(f))
+		buf = append(buf, b[:]...)
+	}
 	return buf, nil
+}
+
+// bytesToF32 reinterprets a byte slice (4 bytes per float, little-endian)
+// as a []float32. Used by the deserialize path before calling FromFloats.
+func bytesToF32(b []byte) []float32 {
+	n := len(b) / 4
+	out := make([]float32, n)
+	for i := 0; i < n; i++ {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return out
 }
 
 // readTensor reads a [dtype, ndim, shape, nbytes, data] header back out.

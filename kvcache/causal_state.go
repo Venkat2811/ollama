@@ -203,31 +203,31 @@ func (c *Causal) DeserializeState(data []byte) error {
 		off += 4
 
 		var (
-			kDtype, vDtype ml.DType
 			kShape, vShape []int
 			kBytes, vBytes []byte
 			rerr           error
 		)
-		kDtype, kShape, kBytes, off, rerr = readTensor(data, off)
+		// readTensor returns f32-encoded bytes regardless of the
+		// original cache dtype — see writeTensor's comment for why.
+		_, kShape, kBytes, off, rerr = readTensor(data, off)
 		if rerr != nil {
 			return fmt.Errorf("kvcache: layer %d keys: %w", layer, rerr)
 		}
-		vDtype, vShape, vBytes, off, rerr = readTensor(data, off)
+		_, vShape, vBytes, off, rerr = readTensor(data, off)
 		if rerr != nil {
 			return fmt.Errorf("kvcache: layer %d values: %w", layer, rerr)
 		}
 
-		// Reuse this layer's existing context if any (Put already
-		// allocated one); otherwise create a fresh sized context from
-		// the cache's backend so FromBytes lands in the right
-		// device's memory.
-		layerCtx, ok := c.ctxs[layer]
-		if !ok {
-			layerCtx = c.backend.NewContextSize(2).Layer(layer)
-			c.ctxs[layer] = layerCtx
-		}
-		c.keys[layer] = layerCtx.FromBytes(kDtype, kBytes, kShape...)
-		c.values[layer] = layerCtx.FromBytes(vDtype, vBytes, vShape...)
+		// Always build a fresh per-layer context. Reusing c.ctxs[layer]
+		// from a prior cold-path allocation collides with the new
+		// tensors we're about to materialize.
+		layerCtx := c.backend.NewContext().Layer(layer)
+		c.ctxs[layer] = layerCtx
+
+		kFloats := bytesToF32(kBytes)
+		vFloats := bytesToF32(vBytes)
+		c.keys[layer] = layerCtx.FromFloats(kFloats, kShape...)
+		c.values[layer] = layerCtx.FromFloats(vFloats, vShape...)
 	}
 
 	return nil
