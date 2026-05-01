@@ -146,24 +146,43 @@ TPUF_S3_ENDPOINT=http://localhost:9100 ... \
 go run ./integrations/tensorpuffer/smoke
 ```
 
+## End-to-end proof (phi3:mini, 66-token prompt, M3 Max + Metal)
+
+Fresh process per phase, same prompt, fresh foyer for the warm phase
+(forcing an S3 read for the first lookup):
+
+| metric                  | cold (puffer empty) | warm (S3 hit) | speedup |
+| :---                    | ---:                | ---:          | ---:    |
+| `prompt_eval_count`     | 66 tokens           | 66 tokens     | —       |
+| `prompt_eval_duration`  | **210 ms**          | **20 ms**     | **10.4×** |
+| `eval_duration`         | 160 ms              | 153 ms        | ≈1.0×   |
+| stash bytes             | 25.9 MiB            | (loaded)      | —       |
+| log line                | `tensorpuffer stashed slot=0 tokens=66 bytes=25953832` | `tensorpuffer hit slot=0 prompt_len=66 keep=65 blob_bytes=25953832` | |
+
+Same family of result as vllm.rs FULL_SKIP (76×) and llama.cpp's
+upstream `tools/tensorpuffer-bench` (8.8×). Generation-phase
+`eval_duration` is unchanged because the KV reuse only saves the
+prefill compute; once the model starts decoding new tokens, the
+benefit is gone (as expected).
+
 ## Status
 
 - [x] cgo binding around `libtensorpuffer.dylib` (M1, commit `7bc5b444`)
 - [x] `llama.Context.StateSeqGet/SetData` bindings (M2, commit `6324e41e`)
 - [x] Direction B in-tree hooks: load-side in `LoadCacheSlot`, stash-side
       after `Decode` (M3, commit `83ad5121`)
-- [x] Build-clean with `go build ./runner/...`
-- [ ] End-to-end smoke: load a real GGUF, prefill, kill, restart,
-      verify warm hit. (deferred — requires a real model file in the
-      test environment)
-- [ ] Cross-engine compatibility note: `tpuf-cabi-v1` domain matches
-      llama.cpp upstream's `tools/tensorpuffer-bench`, so an Ollama
-      stash *should* be loadable by an upstream llama.cpp
-      tensorpuffer-bench process and vice versa. To verify.
+- [x] Build-clean with `go build ./...`
+- [x] **End-to-end real model proof** on phi3:mini, 10.4× prefill
+      speedup (commit `7700093b`)
+- [ ] Cross-engine compatibility verification: `tpuf-cabi-v1` domain
+      matches llama.cpp upstream's `tools/tensorpuffer-bench`, so an
+      Ollama stash *should* be loadable by an upstream llama.cpp
+      tensorpuffer-bench process and vice versa.
 - [ ] Direction A as a true composition wrapper — blocked on Ollama
       API exposure of `slots` / `InputCacheSlot`.
 - [ ] `ollamarunner` (the pure-Go ML path) — separate codec needed since
       KV state lives in `kvcache.Cache` not in a `*llama.Context`.
+- [ ] N-replicate stress matrix mirroring the vllm.rs n=8 stress.
 
 ## Related
 
